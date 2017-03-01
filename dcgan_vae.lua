@@ -4,34 +4,70 @@ require 'nn'
 require 'dpnn'
 require 'optim'
 require 'lfs'
+require 'nngraph'
+require 'VAEGANCriterion'
+require 'BlockBP'
+
+
+tnt = require 'torchnet'
 local VAE = require 'VAE'
 local discriminator = require 'discriminator'
+local disp = require 'display'
+require 'cunn'
 
-hasCudnn, cudnn = pcall(require, 'cudnn')
-assert(hasCudnn) --check to make sure you have CUDA and CUDNN-enabled GPU 
+local function parse(arg)
+   local cmd = torch.CmdLine()
+   cmd:text()
+   cmd:text('Torch-7 (Torchnet) Imagenet Training script')
+   cmd:text()
+   cmd:text('Options:')
+   cmd:text('---------- General options ----------------------------------')
+   cmd:text()
+   cmd:option('-i',        'images',      'Home of images')
+   cmd:option('-o',        'output',      'Home of output')
+   cmd:option('-GPU',         1,             'Default preferred GPU < only 1 if dpt')
+   cmd:option('-nGPU',        1,             'Number of GPUs to use')
+   cmd:option('-cudnn',       'fastest',     'Options: fastest | deterministic')
+   cmd:option('-manualSeed',  2,             'Manually set RNG seed')
+   cmd:text()
+   cmd:text('---------- Data options ----------------------------------')
+   cmd:text()
+   cmd:option('-nDonkeys',   8,    'number of data loading threads')
+   cmd:option('-imageSize',  64,  'Smallest side of the resized image')
+   cmd:text()
+   cmd:text('---------- Training options ----------------------------------')
+   cmd:text()
+   cmd:option('-nEpochs',    55,   'Number of total epochs to run')
+   cmd:option('-saveEpoch',  10,   'save each <VALUE> epochs')
+   cmd:option('-batchSize',  128,  'mini-batch size (1 = pure stochastic)')
+   cmd:text()
+   cmd:text('---------- Optimization options ----------------------------------')
+   cmd:text()
+   cmd:option('-LR',         0.0,  'learning rate; 0 - default LR/WD recipe')
+   cmd:option('-momentum',   0.9,  'momentum')
+   cmd:option('-WD',         5e-4, 'weight decay')
+   cmd:text()
+   cmd:text('---------- Network options ----------------------------------')
+   cmd:text()
+   cmd:option('-zDim',       100,  'Z dimension')
+   cmd:text()
+   cmd:text('---------- Resume/Finetune options ----------------------------------')
+   cmd:text()
+   cmd:option('-network',    'none', 'model to retrain with')
+   cmd:option('-epoch',       0,     'epochs completed (for LR Policy)')
+   cmd:text()
 
-local argparse = require 'argparse'
-local parser = argparse('dcgan_vae', 'a Torch implementation of the deep convolutional generative adversarial network, with variational autoencoder')
-parser:option('-i --input', 'input directory for image dataset')
-parser:option('-o --output', 'output directory for generated images')
-parser:option('-c --checkpoints', 'directory for saving checkpoints')
-parser:option('-r --reconstruction', 'directory to put samples of reconstructions')
+   local opt = cmd:parse(arg or {})
+   return opt
+end
 
-args = parser:parse()
+local opt = parse(arg)
+print(opt)
 
-input = args.input
-output_folder = args.output
-checkpoints = args.checkpoints
-reconstruct_folder = args.reconstruction
-
---ensure tensors are of correct type
-torch.setdefaulttensortype('torch.FloatTensor')
-torch.setnumthreads(1)
-
-function getFilenames()
+function getFilenames(path)
     queue = {}
     count = 1
-    for file in lfs.dir(input) do
+    for file in lfs.dir(path) do
         if file ~= '.' and file ~= '..' then
             queue[count] = file
             count = count + 1
@@ -50,240 +86,137 @@ function getNumber(num)
   return filename
 end
 
-train_size = 200
-batch_size = 50
-channels = 3
-dim = 64
+filenames = getFilenames(opt.i)
 
-train = torch.Tensor(train_size, channels, dim, dim)
-train = train:cuda()
 
-filenames = getFilenames()
 
-function fillTensor(tensor)
-  for i = 1, train_size do
-    local image_x = image.load(input .. filenames[torch.random(1, #filenames)])
-    local flip_or_not = torch.random(1, 2)
-    if flip_or_not == 1 then
-        image_x = image.hflip(image_x)
-    end
-    local image_ok, image_crop = pcall(image.crop, image_x, 'c', dim, dim)
-    if image_ok then 
-        tensor[i] = image_crop
-    else
-        print('image  cannot be cropped to ' .. dim .. 'x' .. dim .. '. Skipping...')
-    end
+
+RealDataset = tnt.BatchDataset{
+  dataset = tnt.ListDataset{
+    list = filenames,
+    load = function(name)
+      local input = image.scale(image.load(name),opt.imageSize,opt.imageSize):cuda()
+      return {input=input}
+    end,
+    path = opt.i
+  },
+  batchsize=opt.batchSize
+}
+
+dataset = tnt.TransformDataset{
+  dataset = RealDataset,
+  transform = function(sample)
+    local noise_x = torch.Tensor(sample.input:size(1), opt.zDim, 1, 1)
+    noise_x = noise_x:cuda()
+    noise_x:normal(0, 0.01)
+    return {input={sample.input, noise_x},target=sample.input}
   end
-  return tensor
-end
+}
 
-train = fillTensor(train)
+-- NETWORK STUFF
 
-feature_size = channels * dim * dim
+dNoise = .1
 
---initialize the weights to non-zero 
-function weights_init(m)
-   local name = torch.type(m)
-   if name:find('Convolution') then
-      m.weight:normal(0.0, 0.02)
-      m:noBias()
-   elseif name:find('BatchNormalization') then
-      if m.weight then m.weight:normal(1.0, 0.02) end
-      if m.bias then m.bias:fill(0) end
-   end
-end
-
-z_dim = 100
 ndf = 64
 ngf = 64
 naf = 64
 
-encoder = VAE.get_encoder(channels, naf, z_dim)
+encoder = VAE.get_encoder(3, naf, opt.zDim)
 sampler = VAE.get_sampler()
-decoder = VAE.get_decoder(channels, ngf, z_dim)
+decoder = VAE.get_decoder(3, ngf, opt.zDim)
 
-netG = nn.Sequential()
-netG:add(encoder)
-netG:add(sampler)
-netG:add(decoder)
-netG:apply(weights_init)
+netD = discriminator.get_discriminator(3, ndf)
 
-netD = discriminator.get_discriminator(channels, ndf)
-netD:apply(weights_init)
-
-netG = netG:cuda()
 netD = netD:cuda()
-cudnn.convert(netG, cudnn)
-cudnn.convert(netD, cudnn)
+--cudnn.convert(netG, cudnn)
+--cudnn.convert(netD, cudnn)
+--input = nn.Identity()()
+iInput = - nn.Identity()
+zInput = - nn.Identity()
+--G=netG(input)
+L1 = iInput - encoder
+L2 = {L1 - sampler, zInput} - nn.MapTable():add(decoder)
+L3 = {iInput - nn.WhiteNoise(0, dNoise) - nn.BlockBP(), L2 - nn.SelectTable(2) - nn.BlockBP(), L2 - nn.SelectTable(2)} - nn.MapTable():add(netD)
+L4 = L2 - nn.SelectTable(1)
+O = {L3, L4, L1} - nn.FlattenTable()
+--O=nn.JoinTable(1)(D)
+model = nn.gModule({iInput,zInput}, {O}):cuda()
+print(model:forward({torch.randn(1,3,opt.imageSize,opt.imageSize):cuda(),torch.randn(1,100,1,1):cuda()}))
+graph.dot(model.fg, 'Big MLP','network')
 
-criterion = nn.BCECriterion()
-criterion = criterion:cuda()
+GDcriterion = nn.BCECriterion()
+GDcriterion = GDcriterion:cuda()
 
-m_criterion = nn.MSECriterion()
-m_criterion = m_criterion:cuda()
+AEcriterion = nn.MSECriterion()
+AEcriterion = AEcriterion:cuda()
 
-optimStateG = {
-   learningRate =  0.0002,
-   beta1 = 0.5
-}
-
-optimStateD = {
-   learningRate = 0.0002,
-   beta1 = 0.5
-}
 
 --noise to pass through decoder to generate random samples from Z
-noise_x = torch.Tensor(batch_size, z_dim, 1, 1)
+noise_x = torch.Tensor(opt.batchSize, opt.zDim, 1, 1)
 noise_x = noise_x:cuda()
 noise_x:normal(0, 0.01)
 
---label, real or fake, for our GAN
-label = torch.Tensor(batch_size)
+local iterator = tnt.DatasetIterator{
+  --nthread = opt.nDonkeys,
+  dataset = dataset
+}
 
-label = label:cuda()
+local timers = {
+   batchTimer = torch.Timer(),
+   dataTimer = torch.Timer(),
+   epochTimer = torch.Timer(),
+}
 
-real_label = 1
-fake_label = 0
+local engine = tnt.OptimEngine()
 
-dNoise = .1
-
-epoch_tm = torch.Timer()
-tm = torch.Timer()
-data_tm = torch.Timer()
-
---to keep track of our reconstructions
-reconstruct_count = 1
-
-parametersD, gradParametersD = netD:getParameters()
-parametersG, gradParametersG = netG:getParameters()
-
-errD = 0
-errG = 0
-errA = 0
-
-
---training evaluation for discriminator.
-fDx = function(x)
-    if x ~= parametersD then
-        parametersD:copy(x)
-    end
-    gradParametersD:zero()
-
-    -- train with real
-    label:fill(real_label)
-    --slightly noise inputs to help stabilize GAN and allow for convergence
-    input_x = nn.WhiteNoise(0, dNoise):cuda():forward(input_x)
-    output = netD:forward(input_x)
-    errD_real = criterion:forward(output, label)
-    df_do = criterion:backward(output, label)
-    if (errG < .7 or errD > 1.0) then netD:backward(input_x, df_do) end
-
-    -- train with fake
-    noise_x:normal(0, 0.01)
-    fake = decoder:forward(noise_x)
-    --input_x:copy(fake)
-    label:fill(fake_label)
-    output = netD:forward(fake)
-    errD_fake = criterion:forward(output, label)
-    df_do = criterion:backward(output, label)
-    if (errG < .7 or errD > 1.0) then netD:backward(fake, df_do) end
-
-    errD = errD_real + errD_fake
-    gradParametersD:clamp(-5, 5)
-    return errD, gradParametersD
+engine.hooks.onStart = function(state)
+   state.epoch = opt.epoch or 0
 end
 
---training evaluation for variational autoencoder
-fAx = function(x)
-    if x ~= parametersG then
-        parametersG:copy(x)
-    end
-    --reconstruction loss
-    gradParametersG:zero()
-    output = netG:forward(input_x)
-    --print(output:size(), input_x:size())
-    errA = m_criterion:forward(output, input_x)
-    df_do = m_criterion:backward(output, input_x)
-    netG:backward(input_x, df_do)
-
-    --KLLoss
-    nElements = output:nElement()
-    mean, log_var = table.unpack(encoder.output)
-    var = torch.exp(log_var)
-    KLLoss = -0.5 * torch.sum(1 + log_var - torch.pow(mean, 2) - var)
-    KLLoss = KLLoss / nElements
-    errA = errA + KLLoss
-    gradKLLoss = {mean / nElements, 0.5*(var - 1) / nElements}
-    encoder:backward(input_x, gradKLLoss)
-    if reconstruct_count % 10 == 0 then
-      if reconstruct_folder then
-        image.save(reconstruct_folder .. 'reconstruction' .. getNumber(reconstruct_count) .. '.png', output[1])
-      end
-    end
-    return errA, gradParametersG
+engine.hooks.onStartEpoch = function(state)
+   timers.epochTimer:reset()
 end
 
---training evaluation for generator
-fGx = function(x)
-    if x ~= parametersG then
-        parametersG:copy(x)
-    end
-    gradParametersG:zero()
-    label:fill(real_label)
-    output = netD.output
-    errG = criterion:forward(output, label)
-    df_do = criterion:backward(output, label)
-    df_dg = netD:updateGradInput(input_x, df_do)
-    if (errD < .7 or errG > 1.0) then decoder:backward(noise_x, df_dg) end
-    gradParametersG:clamp(-5, 5)
-    return errG, gradParametersG
+engine.hooks.onSample = function(state)
+   cutorch.synchronize()
+   timers.dataTimer:stop()
 end
 
---generate samples from Z
-generate = function(epoch)
-    noise_x:normal(0, 0.01)
-    local generations = decoder:forward(noise_x)
-    image.save(output_folder .. getNumber(epoch) .. '.png', generations[1])
+
+engine.hooks.onForwardCriterion = function(state)
+  if state.training then
+    print(('Epoch:%d [%d]   [Data/BatchTime %.3f/%.3f]   LR %.0e   ErrG %.4f  ErrD %.4f  ErrVAE %.4f'):format(
+     state.epoch+1, state.t, timers.dataTimer:time().real, 
+     timers.batchTimer:time().real, state.config.learningRate,
+     state.criterion.errG,state.criterion.errD,state.criterion.errVAE))
+    disp.image(state.network.output[4],{title="VAE",win=2})
+    disp.image(state.network.forwardnodes[11].data.module.output[2],{title="generations",win=1})
+    timers.batchTimer:reset() -- cycle can start anywhere
+  end
 end
 
-require 'optim'
-require 'cunn'
-
-for epoch = 1, 50000 do
-    epoch_tm:reset()
-    --main training loop
-    for i = 1, train_size, batch_size do
-        --split training data into mini-batches
-        local size = math.min(i + batch_size - 1, train_size) - i
-        input_x = train:narrow(1, size, batch_size)
-        tm:reset()
-        --optim takes an evaluation function, the parameters of the model you wish to train, and the optimization options, such as learning rate and momentum
-        optim.adam(fAx, parametersG, optimStateG)  --VAE
-        optim.adam(fDx, parametersD, optimStateD) --discriminator
-        optim.adam(fGx, parametersG, optimStateG) --generator
-        collectgarbage('collect')
-    end
-    reconstruct_count = reconstruct_count + 1
-    if errG then
-      print("Generator loss: " .. errG .. ", Autoencoder loss: " .. errA .. ", Discriminator loss: " .. errD)
-      else print("Discriminator loss: " .. errD)
-    end
-    parametersD, gradParametersD = nil, nil
-    parametersG, gradParametersG = nil, nil
-    --save and/or clear model state for next training batch
-    if epoch % 1000 == 0 then
-        torch.save(checkpoints .. epoch .. '_net_G.t7', netG:clearState())
-        torch.save(checkpoints .. epoch .. '_net_D.t7', netD:clearState())
-    else
-        netG:clearState()
-        netD:clearState()
-    end
-    generate(epoch)
-    train = fillTensor(train)
-    parametersD, gradParametersD = netD:getParameters()
-    parametersG, gradParametersG = netG:getParameters()
-    --simulated annealing for the discriminator's noise parameter
-    if epoch % 10 == 0 then dNoise = dNoise * 0.99 end
-    print(('End of epoch %d / %d \t Time Taken: %.3f'):format(
-           epoch, 10000, epoch_tm:time().real))
+engine.hooks.onUpdate = function(state)
+   cutorch.synchronize()
+   timers.dataTimer:reset()
+   timers.dataTimer:resume()
 end
+
+engine.hooks.onEndEpoch = function(state)
+  print("Total Epoch time (Train):",timers.epochTimer:time().real)
+  if state.epoch % 10 == 0 then dNoise = dNoise * 0.99 end
+  if state.epoch % opt.saveEpoch == 0 then
+    torch.save(paths.concat(opt.o,'model_' .. state.epoch ..'.t7'),state.network)
+  end
+end
+
+
+engine:train{
+     network = model,
+     criterion = nn.VAEGANCriterion():cuda(),
+     iterator = iterator,
+     optimMethod = optim.sgd,
+     config = {
+        learningRate = 0.001,
+        momentum = 0.9,
+     },
+  }
