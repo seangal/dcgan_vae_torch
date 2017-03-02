@@ -7,6 +7,7 @@ require 'lfs'
 require 'nngraph'
 require 'VAEGANCriterion'
 require 'BlockBP'
+require 'MyMapTable'
 
 
 tnt = require 'torchnet'
@@ -43,7 +44,7 @@ local function parse(arg)
    cmd:text()
    cmd:text('---------- Optimization options ----------------------------------')
    cmd:text()
-   cmd:option('-LR',         0.0,  'learning rate; 0 - default LR/WD recipe')
+   cmd:option('-LR',         0.0002,  'learning rate; 0 - default LR/WD recipe')
    cmd:option('-momentum',   0.9,  'momentum')
    cmd:option('-WD',         5e-4, 'weight decay')
    cmd:text()
@@ -103,13 +104,15 @@ RealDataset = tnt.BatchDataset{
   batchsize=opt.batchSize
 }
 
-dataset = tnt.TransformDataset{
+Ddataset = tnt.TransformDataset{
   dataset = RealDataset,
   transform = function(sample)
     local noise_x = torch.Tensor(sample.input:size(1), opt.zDim, 1, 1)
     noise_x = noise_x:cuda()
     noise_x:normal(0, 0.01)
-    return {input={sample.input, noise_x},target=sample.input}
+    --return {input=torch.cat(sample.input, decoder:forward(noise_x),1),target=torch.cat(torch.ones(sample.input:size(1)),torch.ones(sample.input:size(1)):fill(2),1)}
+    --return {input={sample.input:cuda(), noise_x:cuda()},target=torch.cat(torch.ones(sample.input:size(1)),torch.zeros(sample.input:size(1)),1):cuda()}
+    return {input={sample.input:cuda(), noise_x:cuda()},target=sample.input:cuda()}
   end
 }
 
@@ -121,29 +124,36 @@ ndf = 64
 ngf = 64
 naf = 64
 
-encoder = VAE.get_encoder(3, naf, opt.zDim)
-sampler = VAE.get_sampler()
-decoder = VAE.get_decoder(3, ngf, opt.zDim)
+if opt.network == 'none' then
+  encoder = VAE.get_encoder(3, naf, opt.zDim)
+  sampler = VAE.get_sampler()
+  decoder = VAE.get_decoder(3, ngf, opt.zDim)
 
-netD = discriminator.get_discriminator(3, ndf)
+  netD = discriminator.get_discriminator(3, ndf)
 
-netD = netD:cuda()
---cudnn.convert(netG, cudnn)
---cudnn.convert(netD, cudnn)
---input = nn.Identity()()
-iInput = - nn.Identity()
-zInput = - nn.Identity()
---G=netG(input)
-L1 = iInput - encoder
-L2 = {L1 - sampler, zInput} - nn.MapTable():add(decoder)
-L3 = {iInput - nn.WhiteNoise(0, dNoise) - nn.BlockBP(), L2 - nn.SelectTable(2) - nn.BlockBP(), L2 - nn.SelectTable(2)} - nn.MapTable():add(netD)
-L4 = L2 - nn.SelectTable(1)
-O = {L3, L4, L1} - nn.FlattenTable()
---O=nn.JoinTable(1)(D)
-model = nn.gModule({iInput,zInput}, {O}):cuda()
-print(model:forward({torch.randn(1,3,opt.imageSize,opt.imageSize):cuda(),torch.randn(1,100,1,1):cuda()}))
-graph.dot(model.fg, 'Big MLP','network')
-
+  netD = netD:cuda()
+  --cudnn.convert(netG, cudnn)
+  --cudnn.convert(netD, cudnn)
+  --input = nn.Identity()()
+  
+  
+  iInput = - nn.Identity()
+  zInput = - nn.Identity()
+  --G=netG(input)
+  L1 = iInput - encoder
+  L2 = {L1 - sampler, zInput} - nn.MapTable():add(decoder)
+  L3 = {iInput - nn.WhiteNoise(0, dNoise), L2 - nn.SelectTable(2) - nn.BlockBP(), L2 - nn.SelectTable(2)} - nn.MyMapTable():add(netD)
+  L4 = L2 - nn.SelectTable(1)
+  O = {L3, L4, L1} - nn.FlattenTable()
+  --O=nn.JoinTable(1)(D)
+  model = nn.gModule({iInput,zInput}, {O}):cuda()
+  
+  print(model:forward({torch.randn(32,3,opt.imageSize,opt.imageSize):cuda(),torch.randn(32,100,1,1):cuda()}))
+  graph.dot(model.fg, 'Big MLP','network')
+else
+  model = torch.load(opt.network)
+  graph.dot(model.bg, 'Big MLP','back')
+end
 GDcriterion = nn.BCECriterion()
 GDcriterion = GDcriterion:cuda()
 
@@ -155,11 +165,6 @@ AEcriterion = AEcriterion:cuda()
 noise_x = torch.Tensor(opt.batchSize, opt.zDim, 1, 1)
 noise_x = noise_x:cuda()
 noise_x:normal(0, 0.01)
-
-local iterator = tnt.DatasetIterator{
-  --nthread = opt.nDonkeys,
-  dataset = dataset
-}
 
 local timers = {
    batchTimer = torch.Timer(),
@@ -181,16 +186,21 @@ engine.hooks.onSample = function(state)
    cutorch.synchronize()
    timers.dataTimer:stop()
 end
-
-
+gdata = {}
+meter = tnt.ClassErrorMeter{topk={1}}
 engine.hooks.onForwardCriterion = function(state)
   if state.training then
-    print(('Epoch:%d [%d]   [Data/BatchTime %.3f/%.3f]   LR %.0e   ErrG %.4f  ErrD %.4f  ErrVAE %.4f'):format(
-     state.epoch+1, state.t, timers.dataTimer:time().real, 
-     timers.batchTimer:time().real, state.config.learningRate,
-     state.criterion.errG,state.criterion.errD,state.criterion.errVAE))
+    print(('Epoch:%d [%d]   [Data/BatchTime %.3f/%.3f]   LR %.0e   ErrG %.4f  ErrD %.4f  ErrVAE %.4f'):format(state.epoch+1, state.t, timers.dataTimer:time().real,timers.batchTimer:time().real, state.config.learningRate,state.criterion.errG,state.criterion.errD,state.criterion.errVAE))
+    
+    a = torch.round(nn.JoinTable(1):cuda():forward({state.network.output[1],state.network.output[2]}))
+    
+    meter:add(torch.cat(a,torch.ones(a:size(1),a:size(2)):cuda() - a,2),torch.cat(torch.ones(a:size(1)/2),torch.zeros(a:size(1)/2):fill(2),1):cuda())
+    
+    table.insert(gdata,{state.t,meter:value(1)})
+    disp.plot(gdata,{title="PLT",win=4,labels = {"epoch", "1"},ylabel = "ratio"})
     disp.image(state.network.output[4],{title="VAE",win=2})
-    disp.image(state.network.forwardnodes[11].data.module.output[2],{title="generations",win=1})
+    --disp.image(state.network.forwardnodes[11].data.module.output[2],{title="generations",win=1})
+    
     timers.batchTimer:reset() -- cycle can start anywhere
   end
 end
@@ -199,6 +209,7 @@ engine.hooks.onUpdate = function(state)
    cutorch.synchronize()
    timers.dataTimer:reset()
    timers.dataTimer:resume()
+   --graph.dot(model.bg, 'Big MLP','back')
 end
 
 engine.hooks.onEndEpoch = function(state)
@@ -209,6 +220,10 @@ engine.hooks.onEndEpoch = function(state)
   end
 end
 
+local iterator = tnt.DatasetIterator{
+  --nthread = opt.nDonkeys,
+  dataset = Ddataset
+}
 
 engine:train{
      network = model,
@@ -216,7 +231,8 @@ engine:train{
      iterator = iterator,
      optimMethod = optim.sgd,
      config = {
-        learningRate = 0.001,
+        learningRate = opt.LR,
         momentum = 0.9,
+        beta1 = 0.5
      },
   }
