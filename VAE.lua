@@ -3,20 +3,24 @@ require 'dpnn'
 
 local VAE = {}
 
-function VAE.get_encoder(channels, naf, z_dim)
+function VAE.get_encoder(channels, naf, z_dim, imsize)
     encoder = nn.Sequential()
-    encoder:add(nn.SpatialConvolution(channels, naf, 4, 4, 2, 2, 1, 1))
+    encoder:add(nn.SpatialConvolution(channels, naf, 4, 4, 2, 2, 1, 1)) -- 1/2 size
     encoder:add(nn.ReLU())
-    encoder:add(nn.SpatialConvolution(naf, naf * 2, 4, 4, 2, 2, 1, 1))
-    encoder:add(nn.SpatialBatchNormalization(naf * 2)):add(nn.ReLU())
-    encoder:add(nn.SpatialConvolution(naf * 2, naf * 4, 4, 4, 2, 2, 1, 1))
-    encoder:add(nn.SpatialBatchNormalization(naf * 4)):add(nn.ReLU())
-    encoder:add(nn.SpatialConvolution(naf * 4, naf * 8, 4, 4, 2, 2, 1, 1))
-    encoder:add(nn.SpatialBatchNormalization(naf * 8)):add(nn.ReLU())
+    
+    local num = torch.log(imsize)/torch.log(2) - 4 -- IF anyone has a better way go ahead and contribute!
+    print(num)
+    for i=0,num do
+      j=2^i;
+      encoder:add(nn.SpatialConvolution(naf * j, naf * 2 * j, 4, 4, 2, 2, 1, 1)) -- 1/2 size
+      encoder:add(nn.SpatialBatchNormalization(naf * 2 * j)):add(nn.ReLU())
+    end
+    
+    -- size here = size/2^(num) should be 4
 
     zLayer = nn.ConcatTable()
-    zLayer:add(nn.SpatialConvolution(naf * 8, z_dim, 4, 4))
-    zLayer:add(nn.SpatialConvolution(naf * 8, z_dim, 4, 4))
+    zLayer:add(nn.SpatialConvolution(naf * 2^(num+1), z_dim, 4, 4))
+    zLayer:add(nn.SpatialConvolution(naf * 2^(num+1), z_dim, 4, 4))
     encoder:add(zLayer)
     
     return encoder
@@ -47,16 +51,20 @@ function VAE.get_sampler()
     return sampler
 end
 
-function VAE.get_decoder(channels, ngf, z_dim)
+function VAE.get_decoder(channels, ngf, z_dim, imsize)
+    local num = torch.log(imsize)/torch.log(2) - 4 -- IF anyone has a better way go ahead and contribute!
+    print(num)
+  
     decoder = nn.Sequential()
-    decoder:add(nn.SpatialFullConvolution(z_dim, ngf * 8, 4, 4))
-    decoder:add(nn.SpatialBatchNormalization(ngf * 8)):add(nn.ReLU(true))
-    decoder:add(nn.SpatialFullConvolution(ngf * 8, ngf * 4, 4, 4, 2, 2, 1, 1))
-    decoder:add(nn.SpatialBatchNormalization(ngf * 4)):add(nn.ReLU(true))
-    decoder:add(nn.SpatialFullConvolution(ngf * 4, ngf * 2, 4, 4, 2, 2, 1, 1))
-    decoder:add(nn.SpatialBatchNormalization(ngf * 2)):add(nn.ReLU(true))
-    decoder:add(nn.SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
-    decoder:add(nn.SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
+    decoder:add(nn.SpatialFullConvolution(z_dim, ngf * 2^(num+1), 4, 4))
+    decoder:add(nn.SpatialBatchNormalization(ngf * 2^(num+1))):add(nn.ReLU(true))
+    
+    for i=num,0,-1 do
+      j=2^i
+      decoder:add(nn.SpatialFullConvolution(ngf * j *2, ngf * j, 4, 4, 2, 2, 1, 1))
+      decoder:add(nn.SpatialBatchNormalization(ngf * j)):add(nn.ReLU(true))
+    end
+
     decoder:add(nn.SpatialFullConvolution(ngf, channels, 4, 4, 2, 2, 1, 1))
     decoder:add(nn.Sigmoid())
     

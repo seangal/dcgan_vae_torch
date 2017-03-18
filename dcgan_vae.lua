@@ -51,6 +51,7 @@ local function parse(arg)
    cmd:text('---------- Network options ----------------------------------')
    cmd:text()
    cmd:option('-zDim',       100,  'Z dimension')
+   cmd:option('-featureSize',64,   'number of features after first conv')
    cmd:text()
    cmd:text('---------- Resume/Finetune options ----------------------------------')
    cmd:text()
@@ -120,16 +121,16 @@ Ddataset = tnt.TransformDataset{
 
 dNoise = .1
 
-ndf = 64
-ngf = 64
-naf = 64
+ndf = opt.featureSize
+ngf = opt.featureSize
+naf = opt.featureSize
 
 if opt.network == 'none' then
-  encoder = VAE.get_encoder(3, naf, opt.zDim)
+  encoder = VAE.get_encoder(3, naf, opt.zDim, opt.imageSize)
   sampler = VAE.get_sampler()
-  decoder = VAE.get_decoder(3, ngf, opt.zDim)
+  decoder = VAE.get_decoder(3, ngf, opt.zDim, opt.imageSize)
 
-  netD = discriminator.get_discriminator(3, ndf)
+  netD = discriminator.get_discriminator(3, ndf, opt.imageSize)
 
   netD = netD:cuda()
   --cudnn.convert(netG, cudnn)
@@ -148,7 +149,9 @@ if opt.network == 'none' then
   --O=nn.JoinTable(1)(D)
   model = nn.gModule({iInput,zInput}, {O}):cuda()
   
-  print(model:forward({torch.randn(32,3,opt.imageSize,opt.imageSize):cuda(),torch.randn(32,100,1,1):cuda()}))
+  input = {torch.randn(32,3,opt.imageSize,opt.imageSize):cuda(),torch.randn(32,opt.zDim,1,1):cuda()}
+  print(input)
+  print(model:forward(input))
   graph.dot(model.fg, 'Big MLP','network')
 else
   model = torch.load(opt.network)
@@ -190,6 +193,7 @@ gdata = {}
 meter = tnt.ClassErrorMeter{topk={1}}
 engine.hooks.onForwardCriterion = function(state)
   if state.training then
+    meter:reset()
     print(('Epoch:%d [%d]   [Data/BatchTime %.3f/%.3f]   LR %.0e   ErrG %.4f  ErrD %.4f  ErrVAE %.4f'):format(state.epoch+1, state.t, timers.dataTimer:time().real,timers.batchTimer:time().real, state.config.learningRate,state.criterion.errG,state.criterion.errD,state.criterion.errVAE))
     
     a = torch.round(nn.JoinTable(1):cuda():forward({state.network.output[1],state.network.output[2]}))
