@@ -66,6 +66,8 @@ end
 local opt = parse(arg)
 print(opt)
 
+assert(torch.log(opt.imageSize)/torch.log(2) == torch.round(torch.log(opt.imageSize)/torch.log(2)), "imageSize must be a power of 2")
+
 function getFilenames(path)
     queue = {}
     count = 1
